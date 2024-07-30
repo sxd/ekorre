@@ -1,0 +1,5 @@
+# ekorre extension
+comment = 'foreign data wrapper for accessing Git repositories'
+default_version = '1.0.0'
+module_pathname = '$libdir/ekorre'
+relocatable = true
