@@ -30,6 +30,7 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/table.h"
 #include "catalog/pg_foreign_table.h"
