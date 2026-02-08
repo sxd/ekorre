@@ -69,7 +69,7 @@
 #define Natts_git_log 12
 
 /* Convert git_time to use PostgreSQL epoch */
-#define PG_DATE(d) (d) - ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY);
+#define PG_DATE(d) ((d) - ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY)) * USECS_PER_SEC
 
 PG_MODULE_MAGIC;
 
@@ -508,8 +508,6 @@ static TupleTableSlot *
 ekorreIterateForeignScan(ForeignScanState *node)
 {
 	EkorreExecutionState *eestate = (EkorreExecutionState *) node->fdw_state;
-	ForeignScan *scan = (ForeignScan *) node->ss.ps.plan;
-	EkorrePlanState *epstate = (EkorrePlanState *) scan->fdw_private;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	git_oid			oid;
 	git_commit	   *commit;
