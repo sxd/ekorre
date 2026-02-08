@@ -70,7 +70,7 @@
 #define Natts_git_log 12
 
 /* Convert git_time to use PostgreSQL epoch */
-#define PG_DATE(d) (d) - ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY);
+#define PG_DATE(d) ((d) - ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY)) * USECS_PER_SEC
 
 PG_MODULE_MAGIC;
 
