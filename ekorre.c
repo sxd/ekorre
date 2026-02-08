@@ -509,8 +509,6 @@ static TupleTableSlot *
 ekorreIterateForeignScan(ForeignScanState *node)
 {
 	EkorreExecutionState *eestate = (EkorreExecutionState *) node->fdw_state;
-	ForeignScan *scan = (ForeignScan *) node->ss.ps.plan;
-	EkorrePlanState *epstate = (EkorrePlanState *) scan->fdw_private;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	git_oid			oid;
 	git_commit	   *commit;
