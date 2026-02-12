@@ -88,6 +88,7 @@ typedef struct EkorreExecutionState
 	char	*branch;
 	git_repository *repo;
 	git_revwalk *revwalker;
+	bool  	needs_diff;
 } EkorreExecutionState;
 
 typedef struct EkorrePlanState
@@ -347,7 +348,14 @@ ekorreGetRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 	git_revwalk_push_head(revwalker);
 
 	while (git_revwalk_next(&oid, revwalker) != GIT_ITEROVER)
+	{
 		epstate->ncommits++;
+		/*
+		 * We stop counting after 10k, otherwise the process is too slow
+		 */
+		if (epstate->ncommits >= 10000)
+			break;
+	}
 
 	git_revwalk_free(revwalker);
 
@@ -459,7 +467,7 @@ ekorreGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
 static void
 ekorreBeginForeignScan(ForeignScanState *node, int eflags)
 {
-	/* ForeignScan *plan = (ForeignScan *) node->ss.ps.plan; */
+	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
 	EkorreExecutionState *eestate;
 	int			ret;
 
@@ -479,6 +487,11 @@ ekorreBeginForeignScan(ForeignScanState *node, int eflags)
 	 */
 	eestate = (EkorreExecutionState *) palloc0(sizeof(EkorreExecutionState));
 	get_options(RelationGetRelid(node->ss.ss_currentRelation), &eestate->repopath);
+
+	eestate->needs_diff = true;
+	/* Read column projection info from planner */
+	if (fsplan->fdw_private != NIL)
+		eestate->needs_diff = boolVal(linitial(fsplan->fdw_private));
 
 	/*
 	 * Save our local state for when we are called back.
@@ -556,7 +569,7 @@ ekorreIterateForeignScan(ForeignScanState *node)
 	 * against the empty commit, which is different depending on if the repo
 	 * use sha1 or sha256 commit oids.
 	 */
-	if (git_commit_parentcount(commit) > 0)
+	if (eestate->needs_diff && git_commit_parentcount(commit) > 0)
 	{
 		git_commit  *parent;
 		git_tree	*commit_tree;
@@ -645,15 +658,29 @@ ekorreGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 					 Plan *outer_plan)
 {
 	Index			scan_relid = baserel->relid;
-	ForeignScan		*scan;
-
-	best_path->fdw_private = baserel->fdw_private;
+	List		   *fdw_private;
+	bool			needs_diff = false;
+	Bitmapset	   *attrs = NULL, *diff_cols = NULL;
 
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
-	scan = make_foreignscan(tlist, scan_clauses, scan_relid, NIL,
-							best_path->fdw_private, NIL, NIL, outer_plan);
 
-	return scan;
+	/*
+	 * Determine which columns are needed by examining the target list and
+	 * scan clauses. If none of the diff-related columns are referenced, we
+	 * can skip the expensive diff computation during scanning.
+	 */
+	pull_varattnos((Node *) tlist, scan_relid, &attrs);
+	pull_varattnos((Node *) scan_clauses, scan_relid, &attrs);
+
+	diff_cols = bms_add_range(NULL,
+							  Anum_git_log_deltas + 1 - FirstLowInvalidHeapAttributeNumber,
+							  Anum_git_log_changed_files + 1 - FirstLowInvalidHeapAttributeNumber);
+	needs_diff = bms_overlap(attrs, diff_cols);
+
+	fdw_private = list_make1(makeBoolean(needs_diff));
+
+	return make_foreignscan(tlist, scan_clauses, scan_relid, NIL,
+							fdw_private, NIL, NIL, outer_plan);
 }
 
 static void
