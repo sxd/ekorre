@@ -1,5 +1,5 @@
 /*-------------------------------------------------------------------------
- * 
+ *
  * E K O R R E
  *
  *-------------------------------------------------------------------------
@@ -85,6 +85,7 @@ PG_FUNCTION_INFO_V1(ekorre_validator);
 typedef struct EkorreExecutionState
 {
 	char	*repopath;
+	char *root_branch;
 	char	*branch;
 	git_repository *repo;
 	git_revwalk *revwalker;
@@ -94,6 +95,8 @@ typedef struct EkorreExecutionState
 typedef struct EkorrePlanState
 {
 	char	*repopath;
+	char *root_branch;
+	char	*branch;
 	List	*options;
 
 	double	ncommits;
@@ -112,6 +115,8 @@ struct EkorreOption
 static const struct EkorreOption valid_options[] = {
 	/* Repository options */
 	{"repopath", ForeignTableRelationId},
+	{"branch", ForeignTableRelationId},
+	{"root_branch", ForeignTableRelationId},
 
 	/* Sentinel option */
 	{NULL, InvalidOid}
@@ -152,7 +157,7 @@ typedef struct EkorreQualInfo
  */
 
 /* Prototypes for internal support functions  */
-static void get_options(Oid foreignTableId, char **repopath);
+static void get_options(Oid foreignTableId, char **repopath, char **branch, char **root_branch);
 static char *git_errmsg(void);
 
 static void ekr_deparse_qual(Expr *node, EkorreQualInfo **qual);
@@ -232,8 +237,12 @@ ekorre_validator(PG_FUNCTION_ARGS)
 	Oid			catalog;
 	ListCell   *cell;
 	char	   *repopath = NULL;
+	char *branch = NULL;
+	char *root_branch = NULL;
 	const struct EkorreOption *option;
 	int			stat;
+	git_repository *repository;
+	git_reference *ref_branch;
 
 	options = untransformRelOptions(PG_GETARG_DATUM(0));
 	catalog = PG_GETARG_OID(1);
@@ -289,6 +298,59 @@ ekorre_validator(PG_FUNCTION_ARGS)
 							   repopath));
 			}
 		}
+
+		if (strcmp(def->defname, "branch") == 0)
+		{
+			if (branch != NULL)
+			{
+				ereport(ERROR,
+						errcode(ERRCODE_SYNTAX_ERROR),
+						errmsg("conflicting or redundant option %s",
+							   branch));
+			}
+			branch = defGetString(def);
+		}
+
+		if (strcmp(def->defname, "root_branch") == 0)
+		{
+			if (root_branch != NULL)
+			{
+				ereport(ERROR,
+						errcode(ERRCODE_SYNTAX_ERROR),
+						errmsg("conflicting or redundant option %s",
+							   root_branch));
+			}
+			root_branch = defGetString(def);
+		}
+
+	}
+
+	if (repopath != NULL && (branch != NULL || root_branch != NULL))
+	{
+		git_libgit2_init();
+		stat = git_repository_open_ext(&repository, repopath, GIT_REPOSITORY_OPEN_NO_SEARCH, NULL);
+
+		if (branch != NULL)
+		{
+			if (git_branch_lookup(&ref_branch, repository, branch, GIT_BRANCH_REMOTE) != 0)
+				ereport(ERROR,
+						errcode_for_file_access(),
+						errmsg("no such branch \"%s\" exists",
+							   branch));
+			git_reference_free(ref_branch);
+		}
+		if (root_branch != NULL)
+		{
+			if (git_branch_lookup(&ref_branch, repository, root_branch, GIT_BRANCH_REMOTE) != 0)
+				ereport(ERROR,
+						errcode_for_file_access(),
+						errmsg("no such branch \"%s\" exists",
+							   root_branch));
+			git_reference_free(ref_branch);
+		}
+
+		git_repository_free(repository);
+		git_libgit2_shutdown();
 	}
 
 	if (catalog == ForeignTableRelationId && repopath == NULL)
@@ -301,7 +363,7 @@ ekorre_validator(PG_FUNCTION_ARGS)
 
 /*
  * ekorreGetRelSize
- * 
+ *
  * Estimate the size of the repository.
  */
 static void
@@ -321,7 +383,7 @@ ekorreGetRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 	epstate->restrictquals = NIL;
 	baserel->fdw_private = (void *) epstate;
 
-	get_options(foreigntableid, &epstate->repopath);
+	get_options(foreigntableid, &epstate->repopath, &epstate->branch, &epstate->root_branch);
 
 	git_libgit2_init();
 
@@ -489,7 +551,7 @@ ekorreBeginForeignScan(ForeignScanState *node, int eflags)
 	 * object.
 	 */
 	eestate = (EkorreExecutionState *) palloc0(sizeof(EkorreExecutionState));
-	get_options(RelationGetRelid(node->ss.ss_currentRelation), &eestate->repopath);
+	get_options(RelationGetRelid(node->ss.ss_currentRelation), &eestate->repopath, &eestate->branch, &eestate->root_branch);
 
 	eestate->needs_diff = true;
 	/* Read column projection info from planner */
@@ -667,6 +729,8 @@ ekorreImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serveroid)
 	List		   *create_commands = NIL;
 	ListCell	   *lc;
 	char		   *repopath;
+	char *branch = NULL;
+	char *root_branch = NULL;
 
 	/*
 	 * As of now only the commit log is supported, a TODO is to support more
@@ -690,6 +754,10 @@ ekorreImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serveroid)
 
 		if (strcmp(defelem->defname, "repopath") == 0)
 			repopath = defGetString(defelem);
+		else if (strcmp(defelem->defname, "branch") == 0)
+			branch = defGetString(defelem);
+		else if (strcmp(defelem->defname, "root_branch") == 0)
+			root_branch = defGetString(defelem);
 		else
 			ereport(ERROR,
 					errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
@@ -723,10 +791,12 @@ ekorreImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serveroid)
 					 "deletions int, "
 					 "changed_files int"
 					 ") SERVER %s "
-					 "OPTIONS (repopath '%s')",
+					 "OPTIONS (repopath '%s', branch '%s', root_branch '%s')",
 					 stmt->local_schema,
 					 quote_identifier(stmt->server_name),
-					 repopath
+					 repopath,
+					 branch,
+					 root_branch
 					 );
 
 	create_commands = lappend(create_commands, pstrdup(create_stmt.data));
@@ -740,7 +810,7 @@ ekorreImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serveroid)
  */
 
 static void
-get_options(Oid foreignTableId, char **repopath)
+get_options(Oid foreignTableId, char **repopath, char **branch, char **root_branch)
 {
 	ForeignTable *table;
 	ForeignServer *server;
@@ -761,6 +831,8 @@ get_options(Oid foreignTableId, char **repopath)
 	 * of options is empty.
 	 */
 	*repopath = NULL;
+	*branch = NULL;
+	*root_branch = NULL;
 
 	foreach(lc, options)
 	{
@@ -769,6 +841,20 @@ get_options(Oid foreignTableId, char **repopath)
 		if (strcmp(defelem->defname, "repopath") == 0)
 		{
 			*repopath = defGetString(defelem);
+			options = foreach_delete_current(options, lc);
+			break;
+		}
+
+		if (strcmp(defelem->defname, "branch") == 0)
+		{
+			*branch = defGetString(defelem);
+			options = foreach_delete_current(options, lc);
+			break;
+		}
+
+		if (strcmp(defelem->defname, "root_branch") == 0)
+		{
+			*root_branch = defGetString(defelem);
 			options = foreach_delete_current(options, lc);
 			break;
 		}

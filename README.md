@@ -22,6 +22,8 @@ IMPORT FOREIGN SCHEMA git
 FROM SERVER git_server
 INTO public
 OPTIONS (
-	repopath '/path/to/gitrepo'
+	repopath '/path/to/gitrepo',
+    branch 'branch_name',
+    root_branch 'branch_name',
 );
 ```
