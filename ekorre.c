@@ -160,6 +160,9 @@ static void ekr_deparse_opexpr(OpExpr *node, EkorreQualInfo **qual);
 static void ekr_deparse_var(Var *node, EkorreQualInfo **qual);
 static void ekr_deparse_const(Const *node, EkorreQualInfo **qual);
 
+static void ekr_get_commit_info(git_commit *commit, Datum *values);
+static void ekr_get_diff(git_commit *commit, git_repository *repo, Datum *values);
+
 /* Prototypes for public API functions */
 static void ekorreBeginForeignScan(ForeignScanState *node, int eflags);
 static TupleTableSlot *ekorreIterateForeignScan(ForeignScanState *node);
@@ -525,9 +528,6 @@ ekorreIterateForeignScan(ForeignScanState *node)
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	git_oid			oid;
 	git_commit	   *commit;
-	const git_signature *commit_author;
-	const git_signature *commit_committer;
-	char		   *commit_id;
 
 	ExecClearTuple(slot);
 
@@ -551,13 +551,6 @@ ekorreIterateForeignScan(ForeignScanState *node)
 					   git_errmsg()));
 	}
 
-	commit_id = palloc(PG_SHA256_BLOCK_LENGTH + 1);
-	memset(commit_id, '\0', PG_SHA256_BLOCK_LENGTH + 1);
-	git_oid_fmt(commit_id, git_commit_id(commit));
-
-	commit_author = git_commit_author(commit);
-	commit_committer = git_commit_committer(commit);
-
 	/*
 	 * We have a revision to show.
 	 */
@@ -571,32 +564,7 @@ ekorreIterateForeignScan(ForeignScanState *node)
 	 */
 	if (eestate->needs_diff && git_commit_parentcount(commit) > 0)
 	{
-		git_commit  *parent;
-		git_tree	*commit_tree;
-		git_tree	*parent_tree;
-		git_diff	*diff;
-		git_diff_stats *diffstats;
-
-		git_commit_parent(&parent, commit, 0);
-
-		git_commit_tree(&parent_tree, parent);
-		git_commit_tree(&commit_tree, commit);
-
-		git_diff_tree_to_tree(&diff, eestate->repo, parent_tree, commit_tree, NULL);
-
-		git_diff_get_stats(&diffstats, diff);
-
-		slot->tts_values[Anum_git_log_deltas] = git_diff_num_deltas(diff);
-		slot->tts_values[Anum_git_log_insertions] = git_diff_stats_insertions(diffstats);
-		slot->tts_values[Anum_git_log_deletions] = git_diff_stats_deletions(diffstats);
-		slot->tts_values[Anum_git_log_changed_files] = git_diff_stats_files_changed(diffstats);
-
-		git_diff_stats_free(diffstats);
-		git_diff_free(diff);
-
-		git_commit_free(parent);
-		git_tree_free(commit_tree);
-		git_tree_free(parent_tree);
+	    ekr_get_diff(commit,eestate->repo, slot->tts_values);
 	}
 	else
 	{
@@ -606,18 +574,7 @@ ekorreIterateForeignScan(ForeignScanState *node)
 		slot->tts_isnull[Anum_git_log_changed_files] = true;
 	}
 
-	slot->tts_values[Anum_git_log_commit_id] = PointerGetDatum(cstring_to_text(commit_id));
-	/* Author */
-	slot->tts_values[Anum_git_log_author_name] = PointerGetDatum(cstring_to_text(commit_author->name));
-	slot->tts_values[Anum_git_log_author_email] = PointerGetDatum(cstring_to_text(commit_author->email));
-	slot->tts_values[Anum_git_log_author_date] = PG_DATE(commit_author->when.time);
-	/* Committer */
-	slot->tts_values[Anum_git_log_committer_name] = PointerGetDatum(cstring_to_text(commit_committer->name));
-	slot->tts_values[Anum_git_log_committer_email] = PointerGetDatum(cstring_to_text(commit_committer->email));
-	slot->tts_values[Anum_git_log_committer_date] = PG_DATE(commit_committer->when.time);
-
-	slot->tts_values[Anum_git_log_summary] = PointerGetDatum(cstring_to_text(git_commit_summary(commit)));
-	slot->tts_values[Anum_git_log_message] = PointerGetDatum(cstring_to_text(git_commit_message(commit)));
+	ekr_get_commit_info(commit, slot->tts_values);
 
 	ExecStoreVirtualTuple(slot);
 
@@ -993,4 +950,63 @@ ekr_deparse_opexpr(OpExpr *node, EkorreQualInfo **qual)
 	}
 
 	ReleaseSysCache(tuple);
+}
+
+static void
+ekr_get_diff(git_commit *commit, git_repository *repo,
+			 Datum *values)
+{
+	git_commit *parent;
+	git_tree *commit_tree;
+	git_tree *parent_tree;
+	git_diff *diff;
+	git_diff_stats *diffstats;
+
+	git_commit_parent(&parent, commit, 0);
+
+	git_commit_tree(&parent_tree, parent);
+	git_commit_tree(&commit_tree, commit);
+
+	git_diff_tree_to_tree(&diff, repo, parent_tree, commit_tree, NULL);
+
+	git_diff_get_stats(&diffstats, diff);
+
+	values[Anum_git_log_deltas] = git_diff_num_deltas(diff);
+	values[Anum_git_log_insertions] = git_diff_stats_insertions(diffstats);
+	values[Anum_git_log_deletions] = git_diff_stats_deletions(diffstats);
+	values[Anum_git_log_changed_files] = git_diff_stats_files_changed(diffstats);
+
+	git_diff_stats_free(diffstats);
+	git_diff_free(diff);
+	git_commit_free(parent);
+	git_tree_free(commit_tree);
+	git_tree_free(parent_tree);
+}
+
+static void
+ekr_get_commit_info(git_commit *commit, Datum *values)
+{
+	char *commit_id;
+	const git_signature *commit_author;
+	const git_signature *commit_committer;
+
+	commit_id = palloc(PG_SHA256_BLOCK_LENGTH + 1);
+	memset(commit_id, '\0', PG_SHA256_BLOCK_LENGTH + 1);
+	git_oid_fmt(commit_id, git_commit_id(commit));
+
+	commit_author = git_commit_author(commit);
+	commit_committer = git_commit_committer(commit);
+
+	values[Anum_git_log_commit_id] = PointerGetDatum(cstring_to_text(commit_id));
+	/* Author */
+	values[Anum_git_log_author_name] = PointerGetDatum(cstring_to_text(commit_author->name));
+	values[Anum_git_log_author_email] = PointerGetDatum(cstring_to_text(commit_author->email));
+	values[Anum_git_log_author_date] = PG_DATE(commit_author->when.time);
+	/* Committer */
+	values[Anum_git_log_committer_name] = PointerGetDatum(cstring_to_text(commit_committer->name));
+	values[Anum_git_log_committer_email] = PointerGetDatum(cstring_to_text(commit_committer->email));
+	values[Anum_git_log_committer_date] = PG_DATE(commit_committer->when.time);
+
+	values[Anum_git_log_summary] = PointerGetDatum(cstring_to_text(git_commit_summary(commit)));
+	values[Anum_git_log_message] = PointerGetDatum(cstring_to_text(git_commit_message(commit)));
 }
